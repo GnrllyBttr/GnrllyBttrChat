@@ -1,274 +1,404 @@
-# GnrllyBttrChat: Design Spec
+# GnrllyBttr Chat: 1.0 Spec
 
-Final spec for GnrllyBttrChat 1.0: user and AI chats, sharing, calls and a Marketplace, built test-first in a Bun and Turborepo monorepo. Decisions, and the items still open, are at the end.
+Requirements for GnrllyBttr Chat 1.0 (`@gnrllybttr/chat`). The why is in [README.md](README.md), the release plan in [docs/roadmap.md](docs/roadmap.md), sourced findings in [docs/research/](docs/research/), and each decision's reasoning in [docs/adr/](docs/adr/).
 
-## Goals
+Requirement words: **must** is required, **should** is expected unless an ADR says otherwise, **won't** is out of scope for 1.0.
 
-GnrllyBttrChat is an MIT-licensed, open-source TypeScript chat backend that runs inside your app and stores everything in your database, the way Better Auth does for auth. It keeps Chatpack's core model and closes its gaps:
+## 1. What it is
 
-| Gap in Chatpack today                       | GnrllyBttrChat answer                                                                                    |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Fixed schema, no generate step              | Schema built from config and plugins, with `generate` and `migrate` CLI commands                         |
-| Auth is a bare `{ id }` resolver            | First-class Better Auth integration, plus resolvers for any other auth                                   |
-| Custom data only in a `metadata` JSON field | Typed extra columns that flow into server and client types                                               |
-| Live features stop working on serverless    | SSE and WebSocket both built in, plus hosted pub/sub for serverless                                      |
-| No threads, push, calls or encryption       | Threads, push hooks, GIF and meme providers, 1:1 and group voice and video, opt-in end-to-end encryption |
-| No sharing, AI chat or app ecosystem        | Forwarding and links, opt-in AI chats, and a Marketplace any GnrllyBttrChat app can install from         |
+A TypeScript chat backend that runs inside the developer's own server and stores everything in their own database: Better Auth, but for chat. One config produces the database schema, the HTTP and realtime API, the server and client types, and the runtime validation.
 
-Not in 1.0: a hosted service, or federation between servers.
+**Who it is for:** any app with chat in it ([ADR 2](docs/adr/0002-audience.md)):
 
-## Built in vs first-party plugins
+| App                   | Example                                     | Plugins it leans on                                   |
+| --------------------- | ------------------------------------------- | ----------------------------------------------------- |
+| SaaS in-app messaging | Buyer and seller, coach and client          | Tenancy (core), system messages, moderation, media    |
+| 1:1 messenger         | A simple private chat app                   | Presence, message requests, media, E2EE               |
+| Social group chat     | Group chat inside a social or community app | Groups, mentions, reactions, media, GIFs              |
+| Team chat             | Slack, Discord or Teams style               | Groups, channels, threads, mention inbox, apps        |
 
-Core covers what every chat needs; everything else is a first-party plugin the developer turns on. Small plugins ship inside `@gnrllybttr/chat`; bigger ones are their own packages, named in brackets.
+**Minimal core** ([ADR 17](docs/adr/0017-minimal-core.md)): the base package is the engine plus 1:1 text chat. Every other feature, group chat, replies and reactions included, is a plugin. Features reach parity with Slack, Discord, Teams and WhatsApp through first-party plugins, all shipping before 1.0.
 
-| Area          | Built in (core)                                                            | First-party plugins and packages (opt-in)                               |
-| ------------- | -------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| Conversations | DMs, groups, channels, roles                                               | Invites and join requests                                               |
-| Messages      | Send, edit, delete, replies, threads, emoji reactions                      | Pins, polls, scheduled messages, custom emoji packs                     |
-| Mentions      | `@user`, `@here`, `@channel`, mention inbox, @ badges                      | `@role` mentions                                                        |
-| Read state    | Unread counts, read position                                               | Typing, presence, read receipts                                         |
-| Sharing       | Forward, forward several, share a thread, copy link, device share sheet    | Public web links                                                        |
-| Media         | None                                                                       | Files, images, video, voice notes; GIFs, stickers, memes; link previews |
-| Search        | None                                                                       | Database full-text, or Meilisearch and Typesense                        |
-| Notifications | Events and hooks                                                           | Push: Web Push, FCM, APNs, Expo                                         |
-| Safety        | Permission hooks, rate limits                                              | Moderation: block, mute, report, ban, content filters                   |
-| AI            | None                                                                       | AI chats (`chat-ai`)                                                    |
-| Calls         | None                                                                       | Voice and video, 1:1 and group (`chat-livekit`)                         |
-| Encryption    | None                                                                       | End-to-end encryption (`chat-e2ee`)                                     |
-| Ecosystem     | Plugin API, `define*` helpers                                              | Marketplace host (`chat-apps`), app maker SDK (`chat-app-sdk`)          |
-| Auth          | Resolver interface; Clerk, Auth.js, Supabase, Firebase, JWT resolvers      | Better Auth integration (`chat-better-auth`)                            |
-| Data          | Schema system, CLI, SQL adapters (Kysely, Drizzle, Prisma), memory adapter | MongoDB, DynamoDB, Firestore adapters                                   |
-| Realtime      | SSE, WebSocket, ordering and gap-fill                                      | Redis fan-out, hosted pub/sub (`chat-redis`, `chat-ably`, ...)          |
-| Dev tools     | Typed client, React, Vue and Svelte hooks                                  | UI components (`chat-ui`), test kit (`chat-testing`)                    |
+**Package side vs developer side** ([ADR 5](docs/adr/0005-package-vs-developer-side.md)): the package owns schema, endpoints, types, event contracts and provider interfaces. Whatever runs outside the developer's server (hosting, brokers, media servers, model providers, buckets) is the developer's side. Each vendor area gets one reference adapter.
 
-## Architecture
+**Won't in 1.0:** a hosted service, federation, a central app registry, first-party vendor transports beyond SSE and WebSocket, native VoIP push for ringing locked phones.
 
-One `gnrllyBttrChat()` config produces one request handler inside your server. Chat data goes through a storage adapter into your own database; only plugins you enable, such as calls, AI and Marketplace apps, talk to outside services.
+## 2. Core
 
-&#91;embedded content: GnrllyBttrChat architecture · server parts, transports, LiveKit\]
+Everything in this section ships in `@gnrllybttr/chat` and is always on.
 
-Requests enter through Auth, the core publishes saved events to the realtime transport, and clients join LiveKit rooms directly with tokens the calls plugin mints. AI models and Marketplace apps are reached from the server, never from the browser.
+| Area           | Core contains                                                                                          |
+| -------------- | ------------------------------------------------------------------------------------------------------ |
+| Engine         | Router, `chat.handler`, mount helpers, plugin API, `define*` helpers, config validation               |
+| Data           | Schema system, `generate` and `migrate` CLI, Kysely SQL engine with Kysely/Drizzle/Prisma adapters, memory adapter |
+| Identity       | Auth resolvers (JWT/JWKS, custom), tenancy                                                             |
+| Conversations  | 1:1 direct conversations, exactly one per pair of users per tenant                                     |
+| Messages       | `text` kind with a structured body (§6); send, edit, delete for everyone; `clientMessageId`            |
+| Read state     | Per-participant `lastReadSeq`, unread counts batched across conversations                              |
+| Sync           | Per-conversation `seq` and gap-fill, per-user change feed (`userSeq`), SSE and WebSocket               |
+| Server API     | `chat.api.*` (§9), user delete and export (§10)                                                        |
+| Safety and ops | Rate limits with pluggable storage, `trustedOrigins` and Origin checks, `logger` option               |
 
-## Auth
+Everything else is a plugin (§12).
 
-GnrllyBttrChat has its own handler, adapters and CLI and never builds on Better Auth's core. Auth is a resolver that turns a request into a user `{ id }`; Better Auth gets the most complete one.
+## 3. Architecture
 
-| Auth                      | Setup                                                                | What you get                                                                                                           |
-| ------------------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| Better Auth (first-class) | `auth: betterAuthResolver(auth)` from `@gnrllybttr/chat-better-auth` | Reads the Better Auth session cookie, real foreign keys to its `user` table, names and avatars filled in automatically |
-| Any other auth            | `auth: resolver`                                                     | Prebuilt resolvers for Clerk, Auth.js, Supabase, Firebase and plain JWT, or your own                                   |
+**The whole package**
 
-- **Independent:** GnrllyBttrChat versions on its own and needs no Better Auth install unless you choose it.
-- **Live stream:** served by GnrllyBttrChat's own handler, so Better Auth's GET-and-POST-only endpoint rule never applies.
-- **User profiles:** a `resolveUsers(ids)` hook fills names and avatars from your user store; automatic with Better Auth.
-- **Multi-tenant apps:** a resolver may also return `tenantId`, the customer org a user belongs to; Marketplace installs are scoped by it.
+```
+ CLIENTS                                                  (developer's frontend)
+ +----------------------------------------------------------------------------+
+ |  @gnrllybttr/chat/client -> /react (+ React Native) /vue /svelte /solid    |
+ |  chat-ui (optional components)     chat-e2ee client side (encrypt/decrypt) |
+ +----------------------------------------------------------------------------+
+        |  HTTP (RPC): POST /messages/send, GET /sync, ...     ^  SSE / WebSocket
+        v                                                      |
+ CORE: @gnrllybttr/chat                                    (developer's server)
+ +----------------------------------------------------------------------------+
+ |  chat.handler -> router -> auth resolver -> tenancy -> rate limits         |
+ |                                                  |                         |
+ |  chat.api (trusted, server-only) ----------------+                         |
+ |                                                  v                         |
+ |  +------------------------------ engine ------------------------------+    |
+ |  |  1:1 DMs | text + spans | send / edit / delete | clientMessageId   |    |
+ |  |  read state + unread counts | seq + gap-fill | userFeed (userSeq)  |    |
+ |  |  users.delete / export | import | logger | trustedOrigins / CSRF   |    |
+ |  +--------------------------------------------------------------------+    |
+ |      ^                              |                        |             |
+ |      | plugin API                   v                        v             |
+ |      | (schema, endpoints, hooks,   storage adapter       transport        |
+ |      |  kinds, spans, events)       (defineAdapter)    (defineTransport)   |
+ +------|------------------------------|------------------------|-------------+
+        |                              v                        v
+        |                    Kysely engine:              in-process (default)
+        |                    Postgres, MySQL, SQLite     Redis, Ably, Durable
+        |                    + Drizzle / Prisma          Objects, ...
+        |                    chat-mongodb / -dynamodb    (developer's side)
+        |                    / -firestore
+        |
+ PLUGINS (opt-in, all ship before 1.0)
+ +----------------------------------------------------------------------------+
+ |  in @gnrllybttr/chat (subpath exports)                                     |
+ |    messaging : groups, channels, replies, threads, reactions, mentions,    |
+ |                mention-inbox, role-mentions, presence, notifications,      |
+ |                message-controls, mark-unread, message-requests, invites,   |
+ |                pins, polls, scheduled-messages, custom-emoji,              |
+ |                disappearing-messages                                       |
+ |    identity  : sender-identity, system-messages                            |
+ |    sharing   : forwarding, links, share-links                              |
+ |    reach     : search, push, gifs, link-previews                           |
+ |    safety/ops: moderation, audit-log, opentelemetry                        |
+ |                                                                            |
+ |  separate packages                  talks to (developer's side)            |
+ |    chat-better-auth  ............... Better Auth                           |
+ |    chat-media  ..................... S3 / R2 / MinIO                       |
+ |    chat-ai  ........................ AI SDK -> model providers             |
+ |    chat-calls  ..................... LiveKit (clients send media direct)   |
+ |    chat-e2ee  (experimental) ....... nothing: server only relays keys      |
+ |    chat-apps  ...................... app makers' HTTPS endpoints           |
+ +----------------------------------------------------------------------------+
 
-## Schema
-
-Tables are generated from config plus plugins, Better Auth style. Devs can rename, add columns and add tables, but core columns are locked because ordering and read state depend on them.
-
-**Default tables**
-
-| Table          | Holds                                                       | Locked core columns                                                                                        |
-| -------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `conversation` | DMs, groups, channels                                       | `id`, `type`, `lastSeq`, `lastActivityAt`                                                                  |
-| `participant`  | Membership, role, read state                                | `conversationId`, `userId`, `role`, `lastReadSeq`                                                          |
-| `message`      | Every message, any kind                                     | `id`, `conversationId`, `senderId`, `seq`, `kind`, `threadRootId`, `replyToId`, `forwardOfId`, `deletedAt` |
-| `reaction`     | Emoji reactions                                             | `messageId`, `userId`, `emoji`                                                                             |
-| `mention`      | Who a message names; a seenAt time drives the mention inbox | `messageId`, `userId`                                                                                      |
-| `attachment`   | Files, images, voice notes                                  | `messageId`, `storageKey`, `mime`, `size`                                                                  |
-
-Plugins add their own tables (calls, invites, moderation, push tokens, polls, custom emoji, encryption keys, public share links, Marketplace installs, AI usage).
-
-**What devs can change**
-
-| Change                       | How                      | Example                                |
-| ---------------------------- | ------------------------ | -------------------------------------- |
-| Rename a table or column     | `modelName`, `fieldName` | `message` stored as `chat_messages`    |
-| Add a column                 | `additionalFields`       | `message.priority: number`             |
-| Add a table                  | A plugin's `schema`      | `poll`, `pollVote`                     |
-| Change ID format             | `generateId`             | uuid, cuid, serial                     |
-| Drop or retype a core column | Not allowed              | Would break ordering and unread counts |
-
-```ts
-gnrllyBttrChat({
-  database: drizzleAdapter(db, { provider: "pg" }),
-  schema: {
-    message: {
-      modelName: "chat_messages",
-      additionalFields: { priority: { type: "number", required: false } },
-    },
-  },
-});
+ FOR DEVELOPERS, NOT SHIPPED TO USERS
+   chat-testing   memory adapter, fakes, every contract suite
+   chat-app-sdk   for people building apps that chat-apps installs
 ```
 
-**CLI:** `npx @gnrllybttr/chat generate` writes Drizzle, Prisma or SQL; `npx @gnrllybttr/chat migrate` applies it with the built-in adapter. For MongoDB, DynamoDB and Firestore it writes index and table definitions instead. The same CLI runs whichever auth you use.
+**Plugin dependencies** (`A <- B` means B needs A; `definePlugin` checks this at startup)
 
-## Databases
+```
+ sender-identity <- system-messages
+                 <- chat-ai
+                 <- chat-apps
 
-GnrllyBttrChat ships its own adapters for SQL, MongoDB, DynamoDB and Firestore. Each adapter has two layers: plain reads and writes, and five chat-specific atomic operations.
+ groups          <- channels
+                 <- invites
+                 <- role-mentions -> also needs mentions
 
-- **Generic layer:** `create`, `findOne`, `findMany`, `update`, `delete`, `count`, `transaction`. Same shape as Better Auth's adapter contract, so its adapter authors feel at home, but GnrllyBttrChat's own code ([Better Auth: create a DB adapter](https://better-auth.com/docs/guides/create-a-db-adapter)).
-- **Chat layer:** `appendMessage` (next `seq` and insert in one atomic step), `createDirectOnce` (one DM per pair), `addOnce` (idempotent reactions and members), `countUnread` (batched), `search` (optional).
+ mentions        <- mention-inbox
+                 <- role-mentions
 
-**How each database handles the hard parts**
+ optional links (work better together, not required):
+   notifications -> read by push, mentions
+   system-messages -> used by groups (member.added), chat-calls (call ended)
+   chat-media    -> used by chat-ai (files to models), forwarding (reuse files)
+   audit-log     -> records chat.api and chat-apps actions
+   presence      -> provides @here to mentions
+```
 
-| Database  | Message order (`seq`)                                                               | One DM per pair                                         | Live feed source       | Watch out for                                                                                                                                                              |
-| --------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| MongoDB   | `$inc` on the conversation doc plus insert, in one transaction                      | Unique partial index on `pairKey`                       | Change streams         | Transactions and change streams need a replica set; a single-node one is enough                                                                                            |
-| DynamoDB  | `TransactWriteItems`: bump the counter and put the message; all succeed or all fail | Conditional put (`attribute_not_exists`) on a pair item | DynamoDB Streams       | Only key and index lookups are cheap: one index per access path, per-participant unread counters, search via an OpenSearch adapter                                         |
-| Firestore | Transaction on the conversation doc's counter; messages in a subcollection          | Pair key as the doc ID, created only if absent          | `onSnapshot` listeners | A single doc's update rate is limited and contends when busy; a collection with a sequentially indexed field caps at 500 writes/s. Admin SDK does not run on edge runtimes |
+- Every request enters through the auth resolver, except `chat.api` calls, which are trusted (§9).
+- Core saves first, then publishes. Nothing is published that wasn't saved, except ephemeral events (§8).
+- Only enabled plugins talk to outside services, always from the server, except call media, which clients send to the media server directly with tokens the calls plugin mints.
 
-Sources: [MongoDB change streams](https://www.mongodb.com/docs/master/changeStreams/), [DynamoDB TransactWriteItems](https://docs.aws.amazon.com/goto/WebAPI/dynamodb-2012-08-10/TransactWriteItems), [Firestore best practices](https://docs.cloud.google.com/firestore/native/docs/best-practices).
+## 4. Runtime, mounting and auth
 
-**Better Auth on the same database**
+**Runtime** ([ADR 4](docs/adr/0004-web-standard-runtime.md))
 
-| Database  | Better Auth today                                                                                                                                                      | Plan                                                                                                                                                          |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| MongoDB   | Official adapter ([Better Auth: database](https://better-auth.com/docs/concepts/database))                                                                             | Auth uses Better Auth's adapter, chat uses `@gnrllybttr/chat-mongodb`, same database                                                                          |
-| Firestore | Community [better-auth-firestore](https://socket.dev/npm/package/better-auth-firestore) (MIT), built to pair with `better-auth-firebase-auth` for Firebase sign-in     | Same split: their adapter for auth, `@gnrllybttr/chat-firestore` for chat                                                                                     |
-| DynamoDB  | No Better Auth adapter found. Auth.js has an official [single-table one](https://authjs.dev/getting-started/adapters/dynamodb), and Auth.js is now part of Better Auth | Ship `@gnrllybttr/better-auth-dynamodb`, a separate Better Auth adapter, so auth can live on DynamoDB next to chat; submit it to Better Auth's community list |
+- Core **must** use only web-standard APIs (`Request`, `Response`, `fetch`, Web Crypto, streams) and pass its suites on Node 20+, Bun, Deno and Cloudflare Workers in CI.
+- Adapters and plugins that can't run on the edge **must** say so and fail at startup with a clear error.
+- `chat.handler` **must** be a plain `(request: Request) => Promise<Response>`. Helpers **must** ship for Next.js (`toNextHandler`), Node/Express (`toNodeHandler`), and WebSocket upgrades on Node, Bun, Deno and Workers.
+- Routing is GnrllyBttr Chat's own router ([ADR 1](docs/adr/0001-own-handler-and-router.md)).
 
-- **DynamoDB catch:** Better Auth looks up users by email, sessions by token and accounts by provider, so each needs its own index (the Auth.js adapter uses one shared `GSI1`). Any other filter would mean a full-table scan, so the adapter should refuse it loudly.
-- **Firebase Auth** already works in standalone mode through the auth resolver.
+**Auth** ([ADR 7](docs/adr/0007-auth.md))
 
-## Type safety
+A resolver turns a request into `{ id, tenantId? }` or `null`.
 
-One config is the source of truth: every extra column, plugin table and message kind shows up in server and client types with no codegen step.
+| Resolver    | Package                        | Notes                                                                                     |
+| ----------- | ------------------------------ | ----------------------------------------------------------------------------------------- |
+| Better Auth | `@gnrllybttr/chat-better-auth` | Session cookie, foreign keys to Better Auth's `user` table, `resolveUsers` filled in       |
+| JWT / JWKS  | core                           | Secret or JWKS URL; claims map to `id` and `tenantId`. Docs recipes for Clerk, Supabase, Auth0, Firebase, Auth.js |
+| Custom      | `defineResolver`               | Any function returning `{ id, tenantId? }` or `null`                                      |
 
-- **Server:** `chat.$Infer.Message`, `chat.$Infer.Conversation` include your `additionalFields` and plugin fields, the way `auth.$Infer.Session` works in Better Auth.
-- **Client:** `createChatClient<typeof chat>()` picks up every server field, plugin endpoint and event, the way Better Auth clients use `$InferServerPlugin` ([Better Auth plugins](https://better-auth.com/docs/concepts/plugins)).
-- **Message kinds:** `message.kind` is a typed union (`text`, `image`, `gif`, `voice`, `call`, `system`, plus plugin kinds like `poll`), each with its own payload type.
-- **Events:** realtime events are one typed union, so `on("message.created", ...)` knows its payload, including plugin events.
-- **Runtime checks:** extra fields are validated at the API edge with any Standard Schema library (Zod, Valibot, ArkType), so types and validation never drift.
+- `resolveUsers(ids)` **must** be the only way core gets names and avatars.
 
-## Realtime
+**Stream auth and request safety** ([ADR 26](docs/adr/0026-security-and-ops.md))
 
-Every message is saved first, then published, and carries a per-conversation `seq` number, so a client that drops off can ask for everything after its last `seq` and miss nothing. How events travel is a swappable transport.
+- The same resolver **must** authenticate SSE and WebSocket connections.
+- Cookie auth works for SSE as-is. Because `EventSource` can't send headers, the client **must** read SSE with `fetch` when using bearer tokens, and core **must** also offer `POST /stream/ticket`: a single-use ticket valid for 30 seconds, passed as a query parameter.
+- `trustedOrigins` **must** be configurable; every mutating request with cookie auth **must** pass an `Origin` check (CSRF). CORS headers come from the same list.
 
-SSE and WebSocket both ship in core as first-class options; the dev picks with `realtime: { transport: "sse" | "websocket" }`, and any transport below can be swapped in.
+## 5. Tenancy
 
-| Transport                                                                    | Use when                                       | Notes                                                                     |
-| ---------------------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------- |
-| SSE (used when unset)                                                        | One long-running server                        | One-way stream from server to browser; auto-reconnect built into browsers |
-| WebSocket                                                                    | Mobile apps, heavy typing and presence traffic | Two-way, lower overhead per event                                         |
-| Redis fan-out                                                                | Several servers                                | Pairs with SSE or WebSocket                                               |
-| Hosted pub/sub (Ably, Pusher, Cloudflare Durable Objects, Supabase Realtime) | Serverless (Vercel, Lambda)                    | Server publishes; browser subscribes directly with a scoped token         |
-| Polling                                                                      | Last resort                                    | No typing or presence                                                     |
+([ADR 8](docs/adr/0008-core-tenancy.md))
 
-- **Ephemeral events** (typing, presence, call ringing) are never stored or replayed.
-- **Fix over Chatpack:** on serverless, Chatpack falls back to polling and loses typing, presence and receipts ([Chatpack guide](https://raw.githubusercontent.com/chddaniel/chatpack/main/llms.txt)). The hosted pub/sub transport keeps them working.
+- When the resolver returns `tenantId`, core **must** stamp it on every row and filter every read, count, search and subscription by it, in core and first-party plugins.
+- Plugin tables are tenant-scoped by default.
+- The storage contract suite **must** prove no read crosses tenants.
+- The column is always generated (nullable), so turning tenancy on later needs no schema change.
 
-## Chat features
+## 6. Messages
 
-Core ships what every chat needs; everything else is an opt-in plugin so apps only pay for what they use.
-
-| Feature                           | Where  | Notes                                                                             |
-| --------------------------------- | ------ | --------------------------------------------------------------------------------- |
-| Send, edit, delete                | Core   | Deletes leave a placeholder so order and counts hold                              |
-| Reply to a message                | Core   | Quote-reply with a live preview of the original                                   |
-| Threads                           | Core   | Side conversation under a message, with its own unread count                      |
-| Emoji reactions                   | Core   | Any emoji or custom key                                                           |
-| Mentions                          | Core   | `@user`, `@here`, `@channel`, plus a mention inbox and badges (details below)     |
-| Read state and unread counts      | Core   | Stored per participant                                                            |
-| DMs, groups, channels             | Core   | Roles: owner, admin, member                                                       |
-| Typing, presence, read receipts   | Plugin | Live only, never stored                                                           |
-| Files, images, video, voice notes | Plugin | Storage adapter: S3, R2, local disk; signed URLs                                  |
-| GIFs, stickers, memes             | Plugin | Provider adapter: Giphy or Klipy                                                  |
-| Custom emoji packs                | Plugin | Per workspace or per conversation                                                 |
-| Link previews                     | Plugin | Server fetches page titles and images, with a guard against internal-network URLs |
-| Pins, polls, scheduled messages   | Plugin | Each its own plugin                                                               |
-| Search                            | Plugin | Database full-text by default; adapter for Meilisearch or Typesense               |
-| Push notifications                | Plugin | Adapters: Web Push, FCM, APNs, Expo                                               |
-| Invites and join requests         | Plugin | Link codes with expiry and use limits                                             |
-| Moderation                        | Plugin | Block, mute, report, ban, content filter hook                                     |
-| End-to-end encryption             | Plugin | Opt-in per conversation; see End-to-end encryption below                          |
-| Forward, copy link, share         | Core   | Public web links are a plugin; see Sharing and forwarding                         |
-| AI chats                          | Plugin | Off until the developer declares an assistant; see AI chats                       |
-
-**GIF note:** Google shut down the Tenor API on June 30, 2026, and Discord, WhatsApp and Bluesky moved to Klipy ([PC Gamer](https://www.pcgamer.com/hardware/google-kills-yet-another-api-shutting-out-all-non-google-platforms-from-favoured-gif-database/)). No Tenor adapter.
-
-**Mentions in detail**
-
-Typing `@` autocompletes people in the conversation, and the message stores their user ids beside the text, so a rename never breaks an old mention.
-
-| Mention          | Reaches                             | Notes                                                                                                    |
-| ---------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `@user`          | That person                         | Must be a participant; mentioning someone outside offers to add them, if the sender can manage the group |
-| `@here`          | Members online now                  | Groups and channels only; needs the presence plugin                                                      |
-| `@channel`       | Every member                        | Groups and channels only                                                                                 |
-| `@role` (plugin) | Members with a role, e.g. `@admins` | Opt-in                                                                                                   |
-
-- **Who can mass-mention:** a `canMentionAll` hook decides who may use `@here` and `@channel`, so big channels don't get spammed.
-- **Mention inbox:** `mentions.list()` returns every message that names me, across conversations, with its own unread count. Chatpack stores mentions but keeps no inbox and notifies nobody ([Chatpack guide](https://raw.githubusercontent.com/chddaniel/chatpack/main/llms.txt)).
-- **Badges:** each conversation returns `unreadMentionCount` next to `unreadCount`, for a separate @ badge.
-- **Notifications:** mentioned users get a `mention.created` event, and `afterMessageMutation` receives `mentionedIds`, so push can target them even in a muted conversation (unless they turned mentions off there).
-- **Edits:** adding a mention on edit notifies that person once; removing one takes it out of their inbox.
-
-## Sharing and forwarding
-
-Any message, including a thread reply, can be forwarded to other chats, linked to, or handed to another app. Forwarding and links are core; public web links are an opt-in plugin.
-
-| Action                             | What happens                                                                                                                                                 | Who can                                                                                                        |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| Forward                            | Posts into each chosen chat (10 by default, configurable) with an optional note and a "Forwarded" card: original text, sender, time, attachments             | Anyone who can read the source and write in the target; `canForward` can block it, e.g. for confidential chats |
-| Forward several                    | Pick several messages, from the main chat or a thread, and forward them as one bundle                                                                        | Same                                                                                                           |
-| Share a thread                     | Forwards the root message with a link to the whole thread                                                                                                    | Same                                                                                                           |
-| Copy link                          | A permalink built by `links.messageUrl(conversationId, messageId)`; opens the app scrolled to that message                                                   | Content shows only to people who can read the chat; others see "No access"                                     |
-| Public link (`share-links` plugin) | Read-only web page behind an unguessable token, with optional expiry; revocable                                                                              | Off by default; `canCreatePublicLink` decides who                                                              |
-| Share to another app               | Client helper opens the device share sheet with the link and text ([MDN: navigator.share](https://developer.mozilla.org/en-US/docs/Web/API/Navigator/share)) | Not in every browser, so it falls back to copying the link                                                     |
-| Send to a Marketplace app          | Message menu actions such as "Create task" (see Marketplace)                                                                                                 | Where an admin installed that app                                                                              |
-
-- **Snapshot plus link:** a forward stores a copy of the original and a pointer to it, so it reads right after edits. "View original" opens the source for people who can read it.
-- **Deletes carry over:** if the original is deleted or removed by a moderator, its forwards show "Original deleted". Set `forward.followDeletes: false` to keep them.
-- **No duplicate files:** forwards reuse the stored attachment; each viewer gets their own signed URL. A file is removed only when no message uses it.
-- **No stacked labels:** forwarding a forward points at the first original.
-- **Encrypted chats:** the client decrypts the source and re-encrypts the forward for the target. Public links and server previews are off for these messages.
-- **Events and limits:** `message.forwarded` fires for plugins and push; forwarding is rate-limited to stop spam.
-
-## Voice and video calls
-
-GnrllyBttrChat's opt-in calls plugin owns ringing, permissions and call history; audio and video run through a swappable media server, LiveKit by default, for both 1:1 and group calls.
-
-- **Why a media server even for 1:1:** group calls need an SFU (a server that forwards each person's stream to everyone else), and direct 1:1 calls still need relay servers to get through firewalls. One path for both is simpler.
-- **Why LiveKit:** Apache 2.0 server, self-host as a single binary or Docker, or use LiveKit Cloud. It authenticates joins with JWT access tokens, sends webhooks, includes TURN relays, and supports recording through Egress ([LiveKit README](https://github.com/livekit/livekit/blob/master/README.md)).
-- **Adapter interface:** `createRoom`, `mintToken`, `endRoom`, `handleWebhook`, so Daily or Cloudflare can be added later.
-
-**Call flow**
-
-1. Caller hits `calls.start` in a conversation. GnrllyBttrChat checks `canCall`, creates a `call` row and sends a `call.ringing` event to the other participants.
-2. Callees accept or decline. No answer within the ringing timeout marks it missed.
-3. On accept, GnrllyBttrChat mints a LiveKit token for that call's room, only for conversation participants.
-4. Clients join the room directly; media never touches the GnrllyBttrChat server.
-5. LiveKit webhooks report joins and leaves. When the room empties, GnrllyBttrChat closes the call and posts a `call` message with its duration.
-
-**Scope:** 1.0 covers audio, video, mute, camera toggle, screen share and a configurable group size. Ringing a locked phone needs native VoIP push (CallKit on iOS), so it waits for a later phase.
-
-## End-to-end encryption
-
-Encryption ships in 1.0 as an opt-in plugin, `@gnrllybttr/chat-e2ee`, switched on per conversation; apps that need server search or AI replies leave it off.
-
-- **Protocol:** MLS (Messaging Layer Security, the IETF standard for encrypted group chat, RFC 9420) via [ts-mls](https://cdn.jsdelivr.net/npm/ts-mls@1.6.2/README.md), an MIT TypeScript library.
-- **What the server sees:** bodies and attachments are ciphertext. Conversation ids, senders, order, timestamps and mentioned user ids stay readable, so unread counts, gap-fill and mention alerts still work.
-- **What turns off there:** server search, link previews, content-filter hooks and server-side AI replies. Search runs on the device instead.
-- **Devices:** each device joins the MLS group as its own member; the plugin adds tables for public key bundles and handshake messages, which the server only relays. A new device can't read older messages unless the app adds key backup.
-- **Calls:** LiveKit supports end-to-end encrypted media ([LiveKit README](https://github.com/livekit/livekit/blob/master/README.md)), so calls in an encrypted conversation can take their keys from the MLS group.
-- **Risk:** ts-mls has had no formal security audit, and its authors advise an independent review before security-critical use ([ts-mls](https://cdn.jsdelivr.net/npm/ts-mls@1.6.2/README.md)). Budget one before 1.0.
-
-## AI chats
-
-User-to-AI chats, like Claude or ChatGPT, ship as an opt-in plugin, `@gnrllybttr/chat-ai`: nothing AI runs until the developer adds it and declares an assistant. Each assistant is a bot user, so AI chats reuse history, unread counts, search, sharing and mentions.
+**Body format** ([ADR 18](docs/adr/0018-message-body.md)): plain text plus typed spans.
 
 ```ts
-gnrllyBttrChat({
+{
+  text: "hey @Sam see https://x.co",
+  spans: [
+    { type: "mention", start: 4, end: 8, userId: "u_2" },
+    { type: "link", start: 13, end: 26, url: "https://x.co" },
+  ],
+}
+```
+
+- Core span types: `link`, `bold`, `italic`, `strike`, `code`, `codeBlock`. Plugins add theirs (`mention`, `emoji`, ...) with a payload schema.
+- Offsets **must** be UTF-16 code units (JavaScript string indices) and **must** be validated: in range, non-overlapping except nesting.
+- `text` alone **must** be enough for search, push previews and AI context.
+- Client helpers convert Markdown to spans and back.
+
+**Idempotent send** ([ADR 19](docs/adr/0019-idempotent-send.md))
+
+- Every send carries a `clientMessageId`, unique per sender per conversation. A send with an id already saved **must** return the saved message instead of creating another.
+- The client shows the message at once with a pending state and swaps in the saved one (optimistic UI).
+
+**Edit and delete**
+
+- Edits set `editedAt`. Deletes are for everyone and leave a placeholder (body removed, `deletedAt` set) so `seq` and counts hold.
+- Delete for me, and edit and delete time windows, come from the `message-controls` plugin.
+
+## 7. Schema
+
+Tables are generated from config plus plugins. Developers can rename tables and columns, add columns and add tables; core columns are locked.
+
+**Core tables**
+
+| Table          | Holds                                    | Locked core columns                                                                                   |
+| -------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `conversation` | Conversations of any type                | `id`, `tenantId`, `type`, `pairKey`, `lastSeq`, `lastActivityAt`                                      |
+| `participant`  | Membership and read state                | `conversationId`, `userId`, `tenantId`, `lastReadSeq`                                                 |
+| `message`      | Every message, any kind                  | `id`, `conversationId`, `tenantId`, `senderId`, `seq`, `kind`, `text`, `spans`, `clientMessageId`, `editedAt`, `deletedAt`, `createdAt` |
+| `userFeed`     | Per-user conversation-level changes      | `userId`, `tenantId`, `userSeq`, `type`, `conversationId`, `payload`, `createdAt`                     |
+
+- `type` is `direct` in core; plugins register more (`group`, `channel`, `ai`).
+- Plugins can add tables and add columns to core tables (for example, `replies` adds `message.replyToId`, `threads` adds `message.threadRootId`, `sender-identity` adds `message.senderType`).
+
+**What developers can change**
+
+| Change                       | How                      | Example                               |
+| ---------------------------- | ------------------------ | ------------------------------------- |
+| Rename a table or column     | `modelName`, `fieldName` | `message` stored as `chat_messages`   |
+| Add a column                 | `additionalFields`       | `conversation.orderId: string`        |
+| Add a table                  | A plugin's `schema`      | `poll`, `pollVote`                    |
+| Change ID format             | `generateId`             | uuid, cuid, serial                    |
+| Drop or retype a core column | Not allowed              | Would break ordering and unread counts |
+
+- `additionalFields` **must** support `index: true` and `unique: true`, so linking a conversation to an app record (an order) is fast and can be idempotent ([ADR 15](docs/adr/0015-no-subject-field.md)).
+
+**CLI and upgrades** ([ADR 22](docs/adr/0022-schema-upgrades.md))
+
+- `npx @gnrllybttr/chat generate` **must** write the full schema for the current config and plugins: Drizzle, Prisma or SQL; index and table definitions for MongoDB, DynamoDB and Firestore.
+- `npx @gnrllybttr/chat migrate` **must** create the schema on an empty database with the Kysely engine.
+- Upgrading between versions: run `generate` again and diff with the ORM's own tools (drizzle-kit, prisma migrate). Every release with schema changes **must** list them in its migration note.
+
+## 8. Sync and realtime
+
+([ADR 5](docs/adr/0005-package-vs-developer-side.md), [ADR 20](docs/adr/0020-user-change-feed.md))
+
+**Two cursors**
+
+| Cursor    | Scope            | Carries                                                                 | Catch-up call                          |
+| --------- | ---------------- | ----------------------------------------------------------------------- | -------------------------------------- |
+| `seq`     | One conversation | Messages and message-level events (edits, deletes, plugin events)        | `GET /messages/list?after=<seq>`       |
+| `userSeq` | One user         | Conversation-level changes: added, removed, updated, unread changed, new last message | `GET /sync?since=<userSeq>` |
+
+- Every stored message event **must** carry its conversation's `seq`; every feed entry its user's `userSeq`. Both are gap-free and strictly increasing.
+- On reconnect a client **must** be able to catch up with one `/sync` call, then fetch messages only for conversations it has open.
+- `userFeed` entries older than `sync.retention` (default 30 days) may be pruned; a client whose cursor is older gets `SYNC_RESET` and reloads its conversation list.
+- Ephemeral events (typing, presence, call ringing, AI token deltas) **must** never be stored or replayed.
+- Events are one typed union; plugins add their own.
+
+**Built in**
+
+| Stream    | Notes                                                  |
+| --------- | ------------------------------------------------------ |
+| SSE       | Default; one-way, auto-reconnect                       |
+| WebSocket | Two-way, lower overhead; needs the upgrade helper (§4)  |
+
+- Config: `realtime: { stream: "sse" | "websocket", transport }`. `transport` defaults to in-process fan-out (single long-running server).
+- `defineTransport` is `publish(channel, event)` and `subscribe(channel, onEvent)`. Redis, Ably, Pusher, Durable Objects and Supabase Realtime are recipes or community packages.
+- The transport contract suite **must** cover delivery, per-conversation ordering and gap-fill after a dropped connection.
+
+## 9. API
+
+([ADR 21](docs/adr/0021-rpc-style-api.md), [ADR 9](docs/adr/0009-trusted-server-api.md))
+
+RPC-style paths that map one-to-one onto `chat.api`: `chat.api.messages.send` is `POST /messages/send`. Reads are `GET`, writes are `POST`. Plugins add endpoints under their own prefix.
+
+**Core endpoints**
+
+| Endpoint                         | `chat.api`                       | Does                                                                 |
+| -------------------------------- | -------------------------------- | -------------------------------------------------------------------- |
+| `POST /conversations/direct`     | `conversations.direct`           | Find or create the DM with a user                                    |
+| `GET /conversations/list`        | `conversations.list`             | The user's conversations by `lastActivityAt`, with unread counts; cursor-paginated |
+| `GET /conversations/get`         | `conversations.get`              | One conversation with participants                                   |
+| `POST /messages/send`            | `messages.send`                  | Send; idempotent on `clientMessageId`                                |
+| `POST /messages/edit`            | `messages.edit`                  | Edit own message                                                     |
+| `POST /messages/delete`          | `messages.delete`                | Delete own message for everyone                                      |
+| `GET /messages/list`             | `messages.list`                  | Page by `before` or `after` `seq`                                    |
+| `POST /read/mark`                | `read.mark`                      | Set `lastReadSeq`                                                    |
+| `GET /sync`                      | `sync`                           | Feed entries after `since`                                           |
+| `GET /stream`                    | —                                | SSE stream                                                           |
+| `GET /ws`                        | —                                | WebSocket upgrade                                                    |
+| `POST /stream/ticket`            | —                                | Single-use stream ticket (§4)                                        |
+| —                                | `users.delete`, `users.export`   | §10                                                                  |
+| —                                | `import`                         | Bulk history import (§10)                                            |
+
+**Errors:** every error is `{ error: { code, message, details? } }` with an HTTP status. Codes: `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `VALIDATION`, `CONFLICT`, `RATE_LIMITED` (with `retryAfter`), `LIMIT_EXCEEDED`, `SYNC_RESET`. The client throws typed errors.
+
+**Default limits** (all configurable)
+
+| Limit                          | Default     |
+| ------------------------------ | ----------- |
+| Message text                   | 10,000 characters |
+| Spans per message              | 500         |
+| Page size                      | 50, max 200 |
+| Request body                   | 1 MB        |
+
+**Trusted server API**
+
+- Every endpoint **must** have a matching `chat.api` function with the same types; `chat.api` **must not** be reachable over HTTP.
+- `chat.api` calls take `as: userId` (or `as: "system"` with the `sender-identity` plugin) and `tenantId` when tenancy is on.
+- `chat.api` **must** skip `can*` permission hooks but still run `before*` and `after*` hooks, validation and publishing.
+
+## 10. User data and import
+
+([ADR 10](docs/adr/0010-user-data.md))
+
+- `chat.api.users.delete(userId)` **must** remove memberships, read state and feed entries, and anonymize messages (body removed, sender shown as "Deleted user") or hard-delete them, per `users.deleteMode`.
+- Every plugin with user-linked tables **must** implement `onUserDelete` and contribute to export; `definePlugin` fails at startup otherwise.
+- `chat.api.users.export(userId)` **must** return all of a user's data as JSON.
+- `chat.api.import` **must** bulk-load conversations and messages with their original timestamps, assigning `seq` in timestamp order, for moving off Stream, Sendbird or a home-grown system. Imports don't publish realtime events.
+
+## 11. Safety and operations
+
+([ADR 26](docs/adr/0026-security-and-ops.md))
+
+- **Rate limits:** per route and per plugin; `rateLimit.storage` is `memory` (default), `database`, or a `defineRateLimitStore`. Docs **must** say memory doesn't work on serverless or across servers.
+- **Logging:** a `logger` option (`debug`, `info`, `warn`, `error`); core never logs message bodies.
+- **Scale targets**, verified by a load test in CI before 1.0:
+
+| Target                                         | Value                                    |
+| ---------------------------------------------- | ---------------------------------------- |
+| Members per conversation                       | 10,000                                   |
+| Sustained sends per conversation               | 100 messages/s, `seq` gap-free           |
+| Unread counts for a user's conversations       | 500 conversations in one query           |
+| Read-state writes                              | Client debounces to at most one per 2 s per conversation |
+
+## 12. Plugins
+
+All first-party plugins ship before 1.0 ([roadmap](docs/roadmap.md)). Small ones are subpath exports of `@gnrllybttr/chat` (`@gnrllybttr/chat/plugins/groups`); big or vendor-tied ones are their own packages.
+
+**Messaging**
+
+| Plugin              | Adds                                                                                                     | Depends on |
+| ------------------- | -------------------------------------------------------------------------------------------------------- | ---------- |
+| `groups`            | `group` conversations, roles (owner, admin, member), `canManage`, conversation management: add, leave, remove, transfer ownership, rename, avatar, description, archive, pin a chat | — |
+| `channels`          | `channel` conversations that members discover and join                                                   | `groups`   |
+| `replies`           | `message.replyToId`, quote-reply with a live preview                                                     | —          |
+| `threads`           | `message.threadRootId`, `threadState` table, per-thread unread; replies don't count toward the chat's unread unless you follow the thread | — |
+| `reactions`         | `reaction` table; any emoji or custom key, idempotent per user                                           | —          |
+| `mentions`          | `mention` span and table, `@user`, `@channel` in groups, `unreadMentionCount`, `mention.created`, `canMentionAll` | — |
+| `mention-inbox`     | `mentions.list()` across conversations, with its own unread count                                        | `mentions` |
+| `role-mentions`     | `@admins` and other role mentions                                                                        | `mentions`, `groups` |
+| `sender-identity`   | `message.senderType` (`user`, `bot`, `system`), `chatBot` table; profile lookup checks bots then `resolveUsers` | — |
+| `system-messages`   | `system` kind as `{ type, params }` with a fallback `text`; other plugins post through it (for example, `groups` posts `member.added`) | `sender-identity` |
+| `presence`          | Typing, online presence, read receipts (with a per-user "hide my receipts" option), `@here`             | —          |
+| `notifications`     | Per-participant `notify` (`all`, `mentions`, `none`) and `mutedUntil`; push and mentions read these      | —          |
+| `message-controls`  | Delete for me, edit and delete time windows                                                              | —          |
+| `mark-unread`       | Mark a conversation or message unread                                                                    | —          |
+| `message-requests`  | `canStartDirect` returns allow, request or deny; held DMs in `messageRequest` ([ADR 16](docs/adr/0016-message-requests-plugin.md)) | — |
+| `invites`           | Link codes with expiry and use limits; join requests                                                     | `groups`   |
+| `pins`, `polls`, `scheduled-messages`, `custom-emoji` | Each its own plugin                                                    | —          |
+| `disappearing-messages` | Per-conversation timer; per-tenant retention policy                                                  | —          |
+
+**Sharing**
+
+| Plugin        | Adds                                                                                                     |
+| ------------- | -------------------------------------------------------------------------------------------------------- |
+| `forwarding`  | Forward to up to 10 chats (configurable) with a note; forward several; share a thread; snapshot plus pointer; "Original deleted" when the source goes (unless `followDeletes: false`); forwarding a forward points at the first original; attachments reused, not copied; `canForward`; `message.forwarded`; rate-limited |
+| `links`       | `links.messageUrl()`, "No access" for non-readers, share-sheet helper with copy-link fallback             |
+| `share-links` | Public read-only pages behind revocable, expiring tokens; `canCreatePublicLink`; off for encrypted chats  |
+
+**Media, discovery and reach**
+
+| Plugin / package      | Adds                                                                                  | Reference adapter       |
+| --------------------- | ------------------------------------------------------------------------------------- | ----------------------- |
+| `chat-media`          | `attachment` table; `image`, `file`, `video`, `voice` kinds; signed URLs; a file is removed only when no message uses it | S3-compatible (S3, R2, MinIO) |
+| `gifs`                | `gif` kind and picker API                                                             | Klipy                   |
+| `link-previews`       | Server-fetched titles and images; **must** block private and internal addresses       | —                       |
+| `search`              | Message search that respects tenancy and read access                                  | Database full-text      |
+| `push`                | Push on new messages and mentions, honouring `notifications`                          | Web Push                |
+| `moderation`          | Block, mute user, report, ban, content-filter hook; in encrypted chats the reporter's client attaches the decrypted message | — |
+| `audit-log`           | `auditLog` table: actor, action, target, tenant; records `chat.api` and app actions   | —                       |
+| `opentelemetry`       | Spans for requests, storage calls and deliveries                                      | —                       |
+
+**Big features** (§13): `chat-ai`, `chat-calls`, `chat-e2ee`, `chat-apps`.
+
+**Vendor interfaces** ([ADR 5](docs/adr/0005-package-vs-developer-side.md)): each has a contract suite in `chat-testing`.
+
+| Interface              | Reference adapter                | Elsewhere (recipes or community)     |
+| ---------------------- | -------------------------------- | ------------------------------------ |
+| `defineAdapter`        | Kysely SQL engine                | —                                    |
+| `defineTransport`      | In-process                       | Redis, Ably, Pusher, Durable Objects |
+| `defineStorageProvider`| S3-compatible                    | Local disk, GCS                      |
+| `defineGifProvider`    | Klipy                            | Giphy                                |
+| `definePushProvider`   | Web Push                         | FCM, APNs, Expo                      |
+| `defineSearchProvider` | Database full-text               | Meilisearch, Typesense, OpenSearch   |
+| `defineCallProvider`   | LiveKit                          | Daily, Cloudflare Calls              |
+| `defineModelProvider`  | AI SDK                           | —                                    |
+| `defineRateLimitStore` | Memory, database                 | Redis                                |
+
+## 13. Big features
+
+### AI chats (`chat-ai`, needs `sender-identity`)
+
+Nothing AI runs until the developer declares an assistant. Each assistant is a `chatBot`, so AI chats reuse history, unread counts, search and sharing.
+
+```ts
+createChat({
   plugins: [
+    senderIdentity(),
     ai({
       assistants: {
-        helper: {
-          model: anthropic("<model>"),
-          system: "You help customers.",
-          tools: { lookupOrder },
-        },
+        helper: { model: anthropic("<model>"), system: "You help customers.", tools: { lookupOrder } },
       },
       allow: { directChats: true, groupMentions: true },
     }),
@@ -276,260 +406,146 @@ gnrllyBttrChat({
 });
 ```
 
-| Feature                           | How                                                                                                                                                                                                                      |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 1:1 AI chat                       | A DM with an assistant; `ai.startChat("helper")`                                                                                                                                                                         |
-| AI in group chats                 | `@helper` in a group asks the assistant; it sees only that chat                                                                                                                                                          |
-| Streaming                         | Tokens arrive as `message.delta` events over SSE or WebSocket; the finished reply is saved once as a normal message                                                                                                      |
-| Stop, regenerate, edit and resend | Stop cancels the model call; regenerate keeps earlier answers as versions to flip between                                                                                                                                |
-| Models                            | Any model through the AI SDK, which puts OpenAI, Anthropic and other providers behind one interface ([AI SDK: streamText](https://ai-sdk.dev/docs/reference/ai-sdk-core/stream-text)), or your own `defineModelProvider` |
-| Tools                             | Developer-defined tools, with optional user approval before one runs; MCP (Model Context Protocol) servers' tools too ([AI SDK: tools](https://ai-sdk.dev/docs/ai-sdk-core/tools-and-tool-calling.md))                   |
-| Files and images                  | Chat attachments go to models that accept them                                                                                                                                                                           |
-| Rich replies                      | `message.kind: "ai"` holds typed parts: text, reasoning, tool calls, sources                                                                                                                                             |
-| Context                           | Recent messages trimmed to the model's limit; a `buildContext` hook can summarise or add your own data                                                                                                                   |
-| Titles and feedback               | Optional auto titles for new AI chats; thumbs up or down on replies, stored for the developer                                                                                                                            |
-| Usage                             | Tokens per user and chat in an `aiUsage` table; `beforeAiRequest` enforces quotas and picks a model per plan                                                                                                             |
+| Feature             | Requirement                                                                                       |
+| ------------------- | ------------------------------------------------------------------------------------------------- |
+| 1:1 AI chat         | `ai.startChat("helper")` opens an `ai` conversation                                               |
+| AI in groups        | With `groups` and `mentions`: `@helper` asks the assistant; it sees only that conversation        |
+| Streaming           | Ephemeral `message.delta` events; the finished reply is saved once as a normal message           |
+| Stop and regenerate | Stop cancels the model call; regenerate keeps earlier answers as versions                        |
+| Tools               | Developer-defined tools with optional user approval; MCP server tools                            |
+| Files and images    | With `chat-media`: attachments go to models that accept them                                     |
+| Rich replies        | `kind: "ai"` holds typed parts: text, reasoning, tool calls, sources                             |
+| Context             | Recent messages trimmed to the model's limit; `buildContext` hook                                |
+| Titles and feedback | Optional auto titles; thumbs up or down stored for the developer                                 |
+| Usage               | `aiUsage` table; `beforeAiRequest` enforces quotas and picks a model per plan                    |
 
-- **Keys stay on the server:** model calls run server-side; API keys never reach the browser.
-- **Users can't pick arbitrary models:** only assistants the developer declared can be used.
-- **Closed tab:** generation keeps going and the reply is saved; reopening fetches it through the normal gap-fill.
-- **Serverless:** long answers can outlast function time limits, so run generation in a background job or a long-running route.
-- **Encrypted chats:** the server can't read them, so assistants can't join them in 1.0.
-- **Hosted AI bots:** an AI bot can also be a Marketplace app, using the same events and API as any app.
-- **Testing:** `@gnrllybttr/chat-testing` ships a fake model that plays scripted streams, so AI features hit 100% coverage with no paid API calls.
+- Model calls **must** run server-side; only declared assistants can be used.
+- Generation **must** continue if the client disconnects; the reply arrives through sync.
+- On serverless, `ai.runGeneration(jobId)` runs a generation from a background job.
+- `chat-testing` ships a fake model that plays scripted streams.
 
-## Plugins and hooks
+### Calls (`chat-calls`)
 
-A GnrllyBttrChat plugin has the same shape as a Better Auth plugin, plus chat-only keys for events and message kinds, so anyone who has written one can write the other.
+The plugin owns ringing, permissions and call history; media runs through the call provider (LiveKit by default).
+
+1. `calls.start` checks `canCall` and `beforeCallStart`, creates a `call` row and sends an ephemeral `call.ringing`.
+2. Callees accept or decline; no answer within the timeout marks it missed.
+3. On accept, the plugin mints a provider token for that room, only for participants.
+4. Clients join the room directly; media never touches the developer's server.
+5. Provider webhooks report joins and leaves; when the room empties the plugin closes the call, posts a `call` message (via `system-messages` when enabled), and runs `onCallEnd`.
+
+**1.0 covers:** audio, video, mute, camera toggle, screen share, configurable group size, recording. **Won't:** ringing locked phones.
+
+### End-to-end encryption (`chat-e2ee`)
+
+([ADR 11](docs/adr/0011-e2ee-experimental.md))
+
+- Ships labelled **experimental and unaudited** (docs and startup warning) until an independent review is published.
+- MLS (RFC 9420) via ts-mls, opt-in per conversation. Each device is its own MLS member; key bundles and handshake messages are relayed, never read, by the server.
+- The server sees ciphertext bodies and attachments; ids, senders, `seq`, timestamps and mentioned user ids stay readable, so unread counts, sync and mention alerts work.
+- Off in encrypted conversations: server search, link previews, content-filter hooks, AI assistants, apps, public links.
+- Forwarding decrypts on the client and re-encrypts for the target. Reports attach the decrypted message from the reporter's client.
+- Calls take media keys from the MLS group.
+- Core **must** stay E2EE-ready: `text` may be opaque ciphertext with `spans` empty.
+
+### Apps (`chat-apps`, `chat-app-sdk`, needs `sender-identity`)
+
+([ADR 12](docs/adr/0012-apps-protocol-now-registry-later.md))
+
+1. **Manifest:** JSON at an HTTPS URL naming the app, icon, scopes, events, slash commands, message-menu actions and endpoint.
+2. **Install:** an admin installs by manifest URL and approves scopes; the plugin creates a `chatBot` and a scoped token per install (per tenant when set).
+3. **Events:** signed with HMAC-SHA256 over a timestamp and body; the SDK rejects anything over 5 minutes old.
+4. **Actions:** the app calls the API with its token.
+5. **UI:** JSON blocks (text, images, buttons, menus, forms) the client renders; clicks go back as events.
+6. **Uninstall:** revokes the token, removes the bot everywhere, notifies the app.
+
+- `apps: { enabled, allow, deny, maxScopes }` is off by default; `canInstallApp` decides who installs.
+- Deliveries go through an outbox with retry and backoff; on serverless a cron or queue runs `apps.deliver()`.
+- Each install is rate-limited; app actions are recorded by `audit-log` when enabled.
+- **Won't in 1.0:** a central registry, publisher verification, delisting, payments.
+
+## 14. Type safety
+
+- `chat.$Infer.*` types **must** include `additionalFields` and every enabled plugin's fields.
+- `createChatClient<typeof chat>()` **must** pick up every field, endpoint, event, message kind and span type with no codegen.
+- Inputs **must** be validated at the edge with any Standard Schema library (Zod, Valibot, ArkType).
+
+## 15. Extending
 
 ```ts
 const polls = () =>
   definePlugin({
     id: "polls",
-    schema: { poll: { fields: { question: { type: "string" } } } }, // picked up by generate
-    endpoints: {
-      vote: createChatEndpoint("/polls/vote", { method: "POST" }, handler),
-    },
-    messageKinds: { poll: pollPayloadSchema }, // adds "poll" to message.kind
-    events: { "poll.voted": voteEventSchema }, // adds a typed realtime event
+    dependsOn: [],
+    schema: { poll: { fields: { question: { type: "string" } } } },
+    endpoints: { vote: createChatEndpoint("/polls/vote", { method: "POST" }, handler) },
+    messageKinds: { poll: pollPayloadSchema },
+    events: { "poll.voted": voteEventSchema },
     hooks: { after: [{ matcher, handler }] },
+    onUserDelete: async (ctx, userId) => { /* ... */ },
     rateLimit: [{ pathMatcher, limit: 10, window: 60 }],
   });
 ```
 
-**Hooks every app can set**
+**App-level hooks:** `canRead`, `canWrite` (plus `canManage`, `canForward`, `canMentionAll`, `canCall`, `canInstallApp` from their plugins), `beforeMessageSend`, `afterMessageMutation`, `beforeCallStart`, `onCallEnd`, `beforeAiRequest`, `databaseHooks.<table>.create/update/delete`.
 
-| Hook                                                        | Runs                                  | Typical use                                           |
-| ----------------------------------------------------------- | ------------------------------------- | ----------------------------------------------------- |
-| `auth`                                                      | Every request (standalone mode)       | Map your session to `{ id }`                          |
-| `canRead`, `canWrite`, `canManage`, `canCall`, `canForward` | Before each action                    | Custom access rules, paid tiers                       |
-| `beforeMessageSend`                                         | Before save                           | Block or rewrite: length caps, profanity, PII filters |
-| `afterMessageMutation`                                      | After save and publish                | Push, email, webhooks, AI replies                     |
-| `beforeCallStart`, `onCallEnd`                              | Around calls                          | Limits, billing, logs                                 |
-| `databaseHooks.<table>.create/update`                       | Around writes                         | Default values, audit trail                           |
-| `canInstallApp`                                             | Before a Marketplace app is installed | Who may install, which apps, which scopes             |
-| `beforeAiRequest`                                           | Before each model call                | Quotas, model per plan, prompt filters                |
+| Extension          | Helper            | Must pass                                                                      |
+| ------------------ | ----------------- | ------------------------------------------------------------------------------ |
+| Plugin             | `definePlugin`    | Startup checks: unique id, declared dependencies present, no route/table/field clashes, `onUserDelete` when user-linked |
+| Database adapter   | `defineAdapter`   | Storage contract suite                                                         |
+| Transport          | `defineTransport` | Transport contract suite                                                       |
+| Vendor providers   | `define*`         | That interface's suite (§12)                                                   |
+| Auth resolver      | `defineResolver`  | Returns `{ id, tenantId? }` or `null`                                          |
 
-**Client plugins** add typed actions and reactive stores (nanostores, as Better Auth uses), which become hooks for React, Vue, Svelte and Solid.
+- `npx @gnrllybttr/chat plugin init` scaffolds a plugin with tests, Biome and the coverage gate.
+- Plugins list `@gnrllybttr/chat` as a peer dependency. Published plugins use the npm keyword `gnrllybttr-chat-plugin`.
+- **Design rules:** one plugin per feature, one adapter per database; features arrive as plugins, never core edits; every adapter and transport passes the same suite; core depends on interfaces, never vendor SDKs; plain objects and functions, no classes, decorators or DI container.
 
-**Build your own plugin, adapter or transport**
+## 16. Clients and UI
 
-Anything core reaches through an interface, others can supply. Each extension is a plain object passed through a small `define*` helper that type-checks it.
+- `@gnrllybttr/chat/client`: framework-agnostic, on nanostores; optimistic sends, sync on reconnect, typed errors.
+- Bindings: `/react` (also React Native and Expo), `/vue`, `/svelte`, `/solid`.
+- `@gnrllybttr/chat-ui`: optional unstyled components, including the blocks renderer. **Must** meet WCAG 2.1 AA: full keyboard use, focus management, screen-reader announcements for new messages.
 
-| Extension                  | Helper                                                          | Must pass                                                                  |
-| -------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| Plugin                     | `definePlugin`                                                  | Startup checks: unique id, no route, table or field clashes, typed options |
-| Database adapter           | `defineAdapter`                                                 | Storage contract suite: ordering, one DM per pair, unread counts           |
-| Realtime transport         | `defineTransport`                                               | Transport suite: delivery, reconnect gap-fill                              |
-| Call, GIF or push provider | `defineCallProvider`, `defineGifProvider`, `definePushProvider` | That provider's suite                                                      |
-| Auth resolver              | `defineResolver`                                                | Returns `{ id }` or `null`                                                 |
+## 17. Repo, release and testing
 
-- **Start:** `npx @gnrllybttr/chat plugin init` scaffolds a plugin package with tests, Biome and the 100% coverage gate already wired.
-- **Test kit:** `@gnrllybttr/chat-testing` ships the memory adapter, a fake transport, a fake clock and every contract suite, so a third-party adapter proves itself with one call: `runStorageContract(myAdapter)`.
-- **Clashes fail fast:** startup stops with a clear error if two plugins claim the same id, route, table or field.
-- **Versioning:** plugins list `@gnrllybttr/chat` as a peer dependency; plugin APIs only break in major versions.
-- **Discovery:** published plugins use the npm keyword `gnrllybttrchat-plugin` and can be listed on the docs site.
+**Repo:** one Bun and Turborepo monorepo at [GnrllyBttr/GnrllyBttrChat](https://github.com/GnrllyBttr/GnrllyBttrChat): `packages/*`, `apps/docs`, `examples/*`.
 
-**Design rules for core and plugins**
+| Job                         | Tool                                          |
+| --------------------------- | --------------------------------------------- |
+| Installs, workspaces, tests | Bun, with catalogs                            |
+| Tasks and caching           | Turborepo                                     |
+| Lint and format             | Biome v2                                      |
+| Type check                  | TypeScript `strict`                           |
+| Build                       | tsdown (ESM, `.d.ts`, publint, attw)          |
+| Dead code                   | Knip                                          |
+| Git hooks and commits       | Lefthook, commitlint (Conventional Commits)   |
+| Versions and changelogs     | Changesets                                    |
+| Publishing                  | npm trusted publishing                        |
+| Dependency updates          | Renovate                                      |
 
-| Rule                  | In practice                                                                                                                        |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Single responsibility | One plugin, one feature; one adapter, one database                                                                                 |
-| Open/closed           | New features arrive as plugins; core is not edited to add them                                                                     |
-| Liskov substitution   | Every adapter and transport passes the same contract suite, so any can replace another                                             |
-| Interface segregation | Small required interfaces, with optional capabilities (search, invites, moderation) on top                                         |
-| Dependency inversion  | Core depends on interfaces (storage, transport, media, auth), never on a vendor SDK                                                |
-| DRY                   | One config produces the database schema, the types and the runtime validation; one suite tests every adapter                       |
-| KISS                  | Plain objects and functions: no classes, decorators or dependency-injection container. Nothing ships without a test and a real use |
+**Release** ([ADR 25](docs/adr/0025-versioning.md))
 
-## Marketplace
+- All first-party packages share one version (a Changesets `fixed` group) until 1.0.
+- During 0.x a minor release may break; every one ships a migration note covering API and schema changes. Patches never break.
+- Merging the Changesets PR packs each package with `bun pm pack` and publishes with `npm publish`.
+- `main`: PRs only, all checks required, linear history. Security: CodeQL, secret scanning, Dependabot alerts, OpenSSF Scorecard.
 
-Anyone can list an app once, and any GnrllyBttrChat-powered app can install it, but only where that app's developer has switched the Marketplace on and an admin approves it. App A and App B each get their own install, token and data; the app never sees across them.
+**Testing** ([ADR 13](docs/adr/0013-coverage.md))
 
-|                              | Plugins                                      | Marketplace apps                                     |
-| ---------------------------- | -------------------------------------------- | ---------------------------------------------------- |
-| Runs                         | Inside your server                           | On the app maker's server                            |
-| Added by                     | The developer, in code, then a deploy        | An admin, at runtime, from what the developer allows |
-| Access                       | Everything your server can do                | Only the scopes the admin approved                   |
-| Shared by App A and App B    | Same npm package, installed in each codebase | Same hosted app, separate installs and tokens        |
-| Listed in the Marketplace as | An npm package                               | A manifest                                           |
+1. Test first; a bug fix starts with a failing test.
+2. Unit tests with the memory adapter, fake transport and fake clock.
+3. Contract suites for every adapter, transport and provider, against real services in CI: Postgres, MySQL, SQLite, MongoDB, DynamoDB Local, Firestore emulator, LiveKit dev server.
+4. Integration tests on the real handler over SSE and WebSocket, on every runtime in §4.
+5. A load test for the scale targets (§11) before 1.0.
+6. Example apps, each smoke-tested in CI: SaaS buyer-seller (Next.js, Better Auth, Postgres), 1:1 messenger (Expo), social group chat (SvelteKit), team chat (React, Hono).
 
-**How a Marketplace app works**
+- Coverage: 100% lines, functions and branches for core, adapters and first-party plugins. A second, branch-measuring runner runs alongside Bun; tests import test APIs through a shim so both runners use the same files.
+- Ignores need a one-line reason (generated files, provably unreachable branches); CI reports new ones on each PR.
 
-1. **Manifest:** JSON naming the app, its icon, the scopes it asks for (such as `messages:read`, `messages:write`, `commands`), the events it wants, its slash commands, its message-menu actions and its HTTPS endpoint.
-2. **Install:** an admin approves the scopes on a consent screen. GnrllyBttrChat creates a bot user for the app and a token limited to those scopes, then sends them to the app.
-3. **Events:** new messages in chats the bot was added to, slash commands and button clicks go to the app's endpoint, signed with HMAC-SHA256 over a timestamp and the body; the app rejects anything over 5 minutes old. Slack signs its app requests the same way ([Slack: verifying requests](https://docs.slack.dev/authentication/verifying-requests-from-slack/)).
-4. **Actions:** the app calls your API with its token to post, reply in a thread, react or open a form.
-5. **UI:** apps never run code inside your app. They send JSON blocks (text, images, buttons, menus, forms), like Slack's Block Kit, which your client draws in its own style; clicks go back to the app as events.
-6. **Uninstall:** revokes the token at once, removes the bot from every chat and tells the app.
+## 18. Open items
 
-**Controls**
-
-| Who       | Controls                                                                                                                              |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Developer | `marketplace: { enabled, allow, deny, maxScopes }`, off by default: allow every listed app, only verified publishers, or a named list |
-| Developer | `canInstallApp` hook: who may install, such as the app owner only or each customer's admins                                           |
-| Admin     | Installs and removes apps, approves scopes, picks which chats each bot may join                                                       |
-| Users     | See an "App" badge on bot messages and can mute an app                                                                                |
-
-- **Per customer:** if the auth resolver returns a `tenantId`, installs are per tenant (one customer org in a multi-tenant app); otherwise per app.
-- **Delivery:** events queue in an outbox table and retry with backoff, so a slow app never blocks chat. On serverless, a cron job or queue runs deliveries.
-- **Safety:** each install is rate-limited, every app action is logged against its install, and apps can't join encrypted chats in 1.0.
-
-**The registry, with no server to run**
-
-- The Marketplace is a public GitHub repo of manifests. Makers submit by pull request; CI checks the manifest and sends a signed test ping to the endpoint, then the maintainer reviews it. Raycast's Store works this way: pull requests are reviewed, then published automatically on merge ([Raycast: publish an extension](https://developers.raycast.com/basics/publish-an-extension)).
-- On merge, CI publishes a signed JSON index as a static file. Each GnrllyBttrChat app fetches and caches it, and the docs site shows the same index as the browsable Marketplace.
-- **Verified publisher:** the maker proves they own the endpoint's domain with a DNS record.
-- **Delisting:** a removed app is flagged in the index, and apps suspend it on their next refresh.
-- **Payments:** none in 1.0; paid apps bill their own customers.
-
-**For app makers:** `@gnrllybttr/chat-app-sdk` verifies signatures, types every event and block, wraps the API, and runs a local host so an app can be built and tested without a real install.
-
-## Repo and tooling
-
-One Bun and Turborepo monorepo. Every check runs locally before commit and again in CI, so `main` only ever holds code that is formatted, typed, tested and buildable.
-
-| Job                                  | Tool                        | Notes                                                                                                                                                                                              |
-| ------------------------------------ | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Runtime, installs, workspaces, tests | Bun                         | Catalogs pin each shared dependency once, in the root `package.json` ([Bun catalogs](https://bun.com/docs/pm/catalogs))                                                                            |
-| Task running and caching             | Turborepo                   | Bun 1.2+ is a stable, supported package manager ([Turborepo support](https://turborepo.dev/docs/support-policy))                                                                                   |
-| Lint, format, import order           | Biome v2                    | Type-aware rules such as `noFloatingPromises` without tsc; one root config that package configs extend ([Biome v2](https://biomejs.dev/blog/biome-v2/))                                            |
-| Type check                           | TypeScript in `strict` mode | `tsc --noEmit` per package                                                                                                                                                                         |
-| Build                                | tsdown                      | ESM plus `.d.ts`; built-in publint and attw checks catch broken package exports ([tsdown lint](https://tsdown.dev/options/lint))                                                                   |
-| Dead code                            | Knip                        | Unused files, exports and dependencies across workspaces ([Knip](https://knip.dev/typescript/unused-dependencies))                                                                                 |
-| Git hooks                            | Lefthook                    | pre-commit: Biome on staged files; commit-msg: commitlint ([Lefthook](https://github.com/Arkweid/lefthook/))                                                                                       |
-| Commit messages                      | commitlint                  | Conventional Commits                                                                                                                                                                               |
-| Versions and changelogs              | Changesets                  | CI opens the release PR                                                                                                                                                                            |
-| Publishing                           | npm trusted publishing      | No stored npm token, provenance added automatically, needs npm CLI 11.5.1+ ([GitHub changelog](https://github.blog/changelog/2025-07-31-npm-trusted-publishing-with-oidc-is-generally-available/)) |
-| Dependency updates                   | Renovate                    | Reads Bun's `bun.lock` ([Renovate PR](https://github.com/renovatebot/renovate/pull/33189))                                                                                                         |
-
-- **Release flow:** merge the release PR, then CI runs `bun pm pack` per package, which swaps `workspace:` and `catalog:` for real versions, and publishes each tarball with `npm publish` ([Bun workspaces](https://bun.com/docs/install/workspaces)).
-- **CI on every PR:** Biome, type check, tests at 100% coverage, contract suites on real databases, build with publint and attw, Knip, commitlint. Turborepo's cache skips unchanged packages.
-- **Protection on `main`:** PRs only, every CI check required, linear history, no force pushes. Required reviews and CODEOWNERS switch on when a second maintainer joins, since GitHub won't let you approve your own PR.
-- **Security:** CodeQL, secret scanning with push protection, Dependabot alerts, OpenSSF Scorecard.
-- **Community files:** README, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, issue and PR templates, MIT LICENSE.
-
-## Testing
-
-Every change starts with a failing test, and CI blocks any merge below 100% coverage.
-
-1. **Test first:** write the test, watch it fail, write the least code that passes, then tidy. A bug fix starts with a test that reproduces the bug.
-2. **Unit tests:** `bun test` with the memory adapter, fake transport and fake clock from `@gnrllybttr/chat-testing`.
-3. **Contract suites:** every adapter runs against a real database in CI: Postgres, MySQL, SQLite, MongoDB (single-node replica set), DynamoDB Local and the Firestore emulator.
-4. **Integration tests:** the real HTTP handler and live stream, in-process, over both SSE and WebSocket.
-5. **Calls and encryption:** calls against a LiveKit dev server; encryption with two in-process ts-mls clients.
-6. **Example apps:** a smoke test each in CI, so code in the docs always runs.
-
-- **Coverage gate:** `bunfig.toml` sets `coverageThreshold = 1`, and `bun test --coverage` exits non-zero below it. Bun enforces lines and functions but does not measure branches ([Bun coverage](https://bun.com/docs/test/coverage)).
-- **Keep the gate honest:** CI keeps Bun's text reporter on, because an LCOV-only run skips the threshold check. Coverage ignores are limited to generated files.
-
-## Packages and build order
-
-Full 1.0 means every phase below ships before the 1.0 tag; earlier releases are 0.x. One monorepo at [GnrllyBttr/GnrllyBttrChat](https://github.com/GnrllyBttr/GnrllyBttrChat) holds `packages/*` (one per npm package), `apps/docs` and `examples/*`.
-
-| Package                                                | Contains                                                                                                                                 |
-| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `@gnrllybttr/chat`                                     | Core, handler, CLI, SQL adapters (Kysely, Drizzle, Prisma), memory adapter, `define*` helpers, forwarding and links, first-party plugins |
-| `@gnrllybttr/chat/client`, `/react`, `/vue`, `/svelte` | Typed client and hooks                                                                                                                   |
-| `@gnrllybttr/chat-testing`                             | Memory adapter, fakes (including a fake model) and contract suites, for core and third-party extensions                                  |
-| `@gnrllybttr/chat-mongodb`, `-dynamodb`, `-firestore`  | Database adapters                                                                                                                        |
-| `@gnrllybttr/chat-better-auth`                         | Better Auth resolver and `user` table link                                                                                               |
-| `@gnrllybttr/better-auth-dynamodb`                     | Separate Better Auth adapter for DynamoDB                                                                                                |
-| `@gnrllybttr/chat-ai`                                  | AI chats plugin                                                                                                                          |
-| `@gnrllybttr/chat-apps`                                | Marketplace host side: installs, scopes, tokens, signed delivery, blocks, slash commands                                                 |
-| `@gnrllybttr/chat-app-sdk`                             | For Marketplace app makers: signature checks, typed events and blocks, API client, local host                                            |
-| `@gnrllybttr/chat-e2ee`                                | MLS encryption plugin                                                                                                                    |
-| `@gnrllybttr/chat-livekit`                             | Call adapter                                                                                                                             |
-| `@gnrllybttr/chat-redis`, `-ably`, ...                 | Transports for several servers or serverless                                                                                             |
-| `@gnrllybttr/chat-ui`                                  | Optional unstyled components, including the blocks renderer                                                                              |
-
-1. **Repo foundation:** Bun, Turborepo, Biome, Lefthook, CI, coverage gate and release pipeline, before any feature code.
-2. **Core:** plugin API, `define*` helpers, test kit, schema system, CLI, SQL adapters, auth resolvers. DMs, groups, messages, replies, reactions, mentions, read state.
-3. **Auth and databases:** Better Auth integration and other resolvers; MongoDB, Firestore and DynamoDB adapters; the Better Auth DynamoDB adapter.
-4. **Realtime:** SSE and WebSocket, Redis fan-out, typing, presence, receipts, one hosted pub/sub transport.
-5. **Media:** attachments, voice notes, GIF provider, link previews.
-6. **Depth:** threads, mention inbox, forwarding and links, search, moderation, push.
-7. **AI chats:** assistants, streaming, tools, usage limits.
-8. **Calls:** LiveKit 1:1, then group, then recording.
-9. **Encryption:** MLS plugin, encrypted calls, outside security review.
-10. **Marketplace:** apps host package, app SDK, registry repo and index.
-11. **1.0:** docs site, plugin starter, example apps, API freeze.
-
-## Decisions
-
-| Decision         | Choice                                                                                                                                                    |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Repo             | New repo, [GnrllyBttr/GnrllyBttrChat](https://github.com/GnrllyBttr/GnrllyBttrChat); not a Chatpack fork, though its MIT code can be borrowed with credit |
-| Name             | GnrllyBttrChat                                                                                                                                            |
-| Better Auth core | Not used: own handler, adapters and CLI. Better Auth stays a first-class, optional integration                                                            |
-| Realtime         | SSE and WebSocket both first-class; the dev picks                                                                                                         |
-| Extensibility    | Anyone can write plugins, adapters and transports; core and plugins follow SOLID, DRY and KISS                                                            |
-| Testing          | TDD, 100% coverage enforced in CI, contract suites on real databases                                                                                      |
-| Tooling          | Bun, Turborepo, Biome, strict TypeScript, Changesets, npm trusted publishing                                                                              |
-| License          | MIT                                                                                                                                                       |
-| Encryption       | In 1.0, as an opt-in plugin                                                                                                                               |
-| Maintainer       | Solo for now, open source from day one                                                                                                                    |
-| Scope            | Full 1.0: every phase in the build order                                                                                                                  |
-| Sharing          | Forward any message or thread reply, copy links, share out; public web links opt-in                                                                       |
-| AI chats         | Opt-in plugin; the developer declares each assistant                                                                                                      |
-| Marketplace      | Hosted apps any GnrllyBttrChat app can install, if its developer enables it and an admin approves; registry is a GitHub repo                              |
-
-**Still open**
-
-- [ ] **npm names:** `@gnrllybttr/chat` and `gnrllybttrchat` were unclaimed on npm on Oct 23, 2026. Create the `@gnrllybttr` org on npm before the first publish.
-- [ ] **Security review:** who reviews the encryption plugin before 1.0, and at what cost.
-- [ ] **Branch coverage** (whether both sides of every `if` ran): Bun doesn't measure it. Accept lines and functions at 100%, or add a second coverage tool.
-- [ ] **Marketplace repo name and reviewer:** for example `GnrllyBttr/GnrllyBttrChat-marketplace`; every listing needs a human review, which falls on the solo maintainer.
-- [ ] **Marketplace in 1.0 or 1.1:** it is the largest addition and comes last in the build order, so it is the easiest to move.
-
-## Sources
-
-- [Chatpack on Best of JS](https://bestofjs.org/projects/chatpack)
-- [Chatpack integration guide (llms.txt)](https://raw.githubusercontent.com/chddaniel/chatpack/main/llms.txt)
-- [Better Auth: Plugins](https://better-auth.com/docs/concepts/plugins)
-- [Better Auth: Database](https://better-auth.com/docs/concepts/database)
-- [Better Auth: Create a database adapter](https://better-auth.com/docs/guides/create-a-db-adapter)
-- [better-auth-firestore](https://socket.dev/npm/package/better-auth-firestore)
-- [Auth.js DynamoDB adapter](https://authjs.dev/getting-started/adapters/dynamodb)
-- [MongoDB change streams](https://www.mongodb.com/docs/master/changeStreams/)
-- [DynamoDB TransactWriteItems](https://docs.aws.amazon.com/goto/WebAPI/dynamodb-2012-08-10/TransactWriteItems)
-- [Firestore best practices](https://docs.cloud.google.com/firestore/native/docs/best-practices)
-- [ts-mls README](https://cdn.jsdelivr.net/npm/ts-mls@1.6.2/README.md)
-- [LiveKit README](https://github.com/livekit/livekit/blob/master/README.md)
-- [PC Gamer: Google kills the Tenor API](https://www.pcgamer.com/hardware/google-kills-yet-another-api-shutting-out-all-non-google-platforms-from-favoured-gif-database/)
-- [Bun: code coverage](https://bun.com/docs/test/coverage)
-- [Bun: catalogs](https://bun.com/docs/pm/catalogs)
-- [Bun: workspaces](https://bun.com/docs/install/workspaces)
-- [Turborepo support policy](https://turborepo.dev/docs/support-policy)
-- [Biome v2](https://biomejs.dev/blog/biome-v2/)
-- [tsdown: lint](https://tsdown.dev/options/lint)
-- [Knip](https://knip.dev/typescript/unused-dependencies)
-- [Lefthook](https://github.com/Arkweid/lefthook/)
-- [npm trusted publishing (GitHub changelog)](https://github.blog/changelog/2025-07-31-npm-trusted-publishing-with-oidc-is-generally-available/)
-- [Renovate: bun.lock support](https://github.com/renovatebot/renovate/pull/33189)
-- [MDN: navigator.share](https://developer.mozilla.org/en-US/docs/Web/API/Navigator/share)
-- [AI SDK: streamText](https://ai-sdk.dev/docs/reference/ai-sdk-core/stream-text)
-- [AI SDK: tools and tool calling](https://ai-sdk.dev/docs/ai-sdk-core/tools-and-tool-calling.md)
-- [Slack: verifying requests](https://docs.slack.dev/authentication/verifying-requests-from-slack/)
-- [Raycast: publish an extension](https://developers.raycast.com/basics/publish-an-extension)
+- [ ] **npm scope:** create the `@gnrllybttr` org before the first publish.
+- [ ] **Branch coverage runner:** pick it (for example, Vitest with V8 coverage) and prove the shim.
+- [ ] **E2EE review:** who reviews `chat-e2ee`, at what cost, and when.
+- [ ] **App registry (post-1.0):** repo, review process, reviewers.
